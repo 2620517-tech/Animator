@@ -1,4 +1,11 @@
-"""Sketch Animator — MVP (AI 없이 동작하는 키프레임 애니메이션 골격)"""
+"""Sketch Animator — MVP (AI 없이 동작하는 키프레임 애니메이션 골격)
+
+성능 최적화 적용:
+  1) 트랜스폼 슬라이더를 form으로 묶어 저장 시 1회만 rerun
+  2) 편집 중 미리보기는 축소 렌더(긴 변 384px), GIF만 원본 크기
+  3) 스케치 캔버스 update_streamlit=False 로 그리기 매끈
+  4) GIF는 키프레임이 바뀔 때만 재생성(@st.cache_data)
+"""
 
 import io
 
@@ -12,8 +19,12 @@ except Exception:
     HAS_CANVAS = False
 
 FIELDS = ("x", "y", "w", "h", "rot")
+PREVIEW_MAX = 384  # 편집 미리보기 긴 변 픽셀
 
 
+# ----------------------------------------------------------------------------
+# 상태
+# ----------------------------------------------------------------------------
 def init_state():
     ss = st.session_state
     ss.setdefault("canvas_w", 512)
@@ -24,11 +35,12 @@ def init_state():
     ss.setdefault("boxes", [])
     ss.setdefault("selected_box_id", None)
     ss.setdefault("next_box_id", 1)
-    ss.setdefault("tx", 256)
-    ss.setdefault("ty", 256)
-    ss.setdefault("tw", 120)
-    ss.setdefault("th", 120)
-    ss.setdefault("trot", 0)
+    # 슬라이더(작업용 트랜스폼) 값
+    ss.setdefault("s_tx", 256)
+    ss.setdefault("s_ty", 256)
+    ss.setdefault("s_tw", 120)
+    ss.setdefault("s_th", 120)
+    ss.setdefault("s_trot", 0)
 
 
 def get_selected_box():
@@ -62,6 +74,13 @@ def delete_box(box_id):
         ss.selected_box_id = ss.boxes[0]["id"] if ss.boxes else None
 
 
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+# ----------------------------------------------------------------------------
+# 보간 엔진
+# ----------------------------------------------------------------------------
 def transform_at(box, frame):
     kfs = sorted(box["keyframes"], key=lambda k: k["frame"])
     if not kfs:
@@ -90,13 +109,17 @@ def delete_keyframe(box, frame):
     box["keyframes"] = [k for k in box["keyframes"] if k["frame"] != frame]
 
 
+# ----------------------------------------------------------------------------
+# 렌더링
+# ----------------------------------------------------------------------------
 def _hex_to_rgb(hex_color):
     hex_color = hex_color.lstrip("#")
     return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
 
 
-def render_frame(boxes, frame, size, show_labels=True):
-    W, H = size
+def render_frame(boxes, frame, size, scale=1.0, show_labels=True):
+    """scale<1 이면 좌표·크기를 줄여 더 작고 빠르게 렌더."""
+    W, H = max(1, int(size[0] * scale)), max(1, int(size[1] * scale))
     img = Image.new("RGBA", (W, H), (255, 255, 255, 255))
     try:
         font = ImageFont.load_default()
@@ -107,13 +130,13 @@ def render_frame(boxes, frame, size, show_labels=True):
         t = transform_at(box, frame)
         if t is None:
             continue
-        w = max(1, int(round(t["w"])))
-        h = max(1, int(round(t["h"])))
+        w = max(1, int(round(t["w"] * scale)))
+        h = max(1, int(round(t["h"] * scale)))
         layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         d = ImageDraw.Draw(layer)
         r, g, b = _hex_to_rgb(box["color"])
 
-        # === AI 연동 지점: box["ai_image"]가 있으면 그걸, 없으면 색칠 사각형 ===
+        # === AI 연동 지점: ai_image 있으면 그걸, 없으면 색칠 사각형 ===
         if box.get("ai_image") is not None:
             layer.alpha_composite(box["ai_image"].convert("RGBA").resize((w, h)))
         else:
@@ -121,24 +144,61 @@ def render_frame(boxes, frame, size, show_labels=True):
                         outline=(30, 30, 30, 255), width=2)
 
         if show_labels and font is not None:
-            d.text((4, 4), box["name"], fill=(20, 20, 20, 255), font=font)
+            d.text((4, 4), box.get("name", ""), fill=(20, 20, 20, 255), font=font)
 
         rotated = layer.rotate(t["rot"], expand=True, resample=Image.BICUBIC)
-        cx, cy = int(round(t["x"])), int(round(t["y"]))
+        cx, cy = int(round(t["x"] * scale)), int(round(t["y"] * scale))
         img.alpha_composite(rotated, (cx - rotated.width // 2, cy - rotated.height // 2))
 
     return img.convert("RGB")
 
 
-def export_gif(boxes, total, size, fps):
-    frames = [render_frame(boxes, f, size, show_labels=False) for f in range(max(1, total))]
+def _signature(boxes):
+    """캐시 키용: 색상 + 정렬된 키프레임만 추출(해시 가능)."""
+    sig = []
+    for box in boxes:
+        kfs = tuple(
+            (kf["frame"], kf["x"], kf["y"], kf["w"], kf["h"], kf["rot"])
+            for kf in sorted(box["keyframes"], key=lambda k: k["frame"])
+        )
+        sig.append((box["color"], kfs))
+    return tuple(sig)
+
+
+@st.cache_data(show_spinner=False)
+def export_gif_cached(signature, total, w, h, fps, interp):
+    """signature가 같으면 캐시된 결과 반환(재렌더 안 함).
+
+    interp = 서브프레임 배수. 각 프레임 사이를 1/interp 간격으로 더 잘게 쪼개
+    선형보간하여 부드러운 모션을 만든다. 재생 속도는 동일하게 유지(프레임 시간 보정).
+    """
+    boxes = [
+        {
+            "name": "",
+            "color": color,
+            "ai_image": None,
+            "keyframes": [dict(zip(("frame",) + FIELDS, kf)) for kf in kfs],
+        }
+        for (color, kfs) in signature
+    ]
+    interp = max(1, int(interp))
+    total = max(1, total)
+    # 0, 1/interp, 2/interp, ... (total-1) 까지 잘게 샘플링 → 선형보간된 중간 프레임
+    steps = (total - 1) * interp + 1
+    frames = [
+        render_frame(boxes, i / interp, (w, h), scale=1.0, show_labels=False)
+        for i in range(steps)
+    ]
     buf = io.BytesIO()
-    duration = max(1, int(round(1000 / max(1, fps))))
+    duration = max(1, int(round(1000 / (max(1, fps) * interp))))  # 속도 유지
     frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:],
                    duration=duration, loop=0, disposal=2)
     return buf.getvalue()
 
 
+# ----------------------------------------------------------------------------
+# UI
+# ----------------------------------------------------------------------------
 def sidebar():
     ss = st.session_state
     with st.sidebar:
@@ -180,7 +240,8 @@ def box_settings(box):
         if HAS_CANVAS:
             res = st_canvas(fill_color="rgba(0,0,0,0)", stroke_width=3, stroke_color="#000000",
                             background_color="#FFFFFF", height=200, width=200,
-                            drawing_mode="freedraw", key=f"canvas_{box['id']}")
+                            drawing_mode="freedraw", update_streamlit=False,
+                            key=f"canvas_{box['id']}")
             if res is not None and res.image_data is not None:
                 im = Image.fromarray(res.image_data.astype("uint8"), "RGBA")
                 buf = io.BytesIO()
@@ -193,37 +254,50 @@ def box_settings(box):
 def keyframe_editor(box):
     ss = st.session_state
     st.subheader("🎞 키프레임 편집기")
+
+    # 현재 프레임(스크럽)은 form 밖 — 옮기면 미리보기가 따라옴
     ss.current_frame = st.slider("현재 프레임", 0, max(0, ss.total_frames - 1),
                                  min(ss.current_frame, ss.total_frames - 1))
 
-    st.markdown("**작업용 트랜스폼** (슬라이더로 정하고 → 키프레임으로 저장)")
-    c1, c2 = st.columns(2)
-    ss.tx = c1.slider("X 위치", 0, ss.canvas_w, int(ss.tx), key="s_tx")
-    ss.ty = c2.slider("Y 위치", 0, ss.canvas_h, int(ss.ty), key="s_ty")
-    ss.tw = c1.slider("너비", 1, ss.canvas_w, int(ss.tw), key="s_tw")
-    ss.th = c2.slider("높이", 1, ss.canvas_h, int(ss.th), key="s_th")
-    ss.trot = st.slider("회전(방향, °)", -180, 180, int(ss.trot), key="s_trot")
+    # 슬라이더 값이 캔버스 범위를 벗어나면 클램프(캔버스 크기 변경 대비)
+    ss.s_tx = _clamp(int(ss.s_tx), 0, ss.canvas_w)
+    ss.s_ty = _clamp(int(ss.s_ty), 0, ss.canvas_h)
+    ss.s_tw = _clamp(int(ss.s_tw), 1, ss.canvas_w)
+    ss.s_th = _clamp(int(ss.s_th), 1, ss.canvas_h)
 
-    cur_t = {"x": ss.tx, "y": ss.ty, "w": ss.tw, "h": ss.th, "rot": ss.trot}
+    # === form: 슬라이더 조작 중엔 rerun 없음, 저장 눌러야 1회 실행 ===
+    with st.form("transform_form"):
+        st.markdown("**작업용 트랜스폼** — 조정 후 아래 버튼으로 저장 (조정 중엔 새로고침 안 함)")
+        c1, c2 = st.columns(2)
+        c1.slider("X 위치", 0, ss.canvas_w, key="s_tx")
+        c2.slider("Y 위치", 0, ss.canvas_h, key="s_ty")
+        c1.slider("너비", 1, ss.canvas_w, key="s_tw")
+        c2.slider("높이", 1, ss.canvas_h, key="s_th")
+        st.slider("회전(방향, °)", -180, 180, key="s_trot")
+        saved = st.form_submit_button("💾 현재 프레임에 키프레임 저장", use_container_width=True)
 
-    b1, b2, b3 = st.columns(3)
-    if b1.button("💾 현재 프레임에 키프레임 저장", use_container_width=True):
-        set_keyframe(box, ss.current_frame, cur_t)
+    if saved:
+        set_keyframe(box, ss.current_frame, {
+            "x": ss.s_tx, "y": ss.s_ty, "w": ss.s_tw, "h": ss.s_th, "rot": ss.s_trot,
+        })
         st.toast(f"프레임 {ss.current_frame}에 키프레임 저장")
-    if b2.button("📥 현재 프레임 값 불러오기", use_container_width=True):
+
+    b1, b2 = st.columns(2)
+    if b1.button("📥 현재 프레임 값 불러오기", use_container_width=True):
         t = transform_at(box, ss.current_frame)
         if t:
-            ss.tx, ss.ty, ss.tw, ss.th, ss.trot = (int(t["x"]), int(t["y"]),
-                                                   int(t["w"]), int(t["h"]), int(t["rot"]))
+            ss.s_tx, ss.s_ty, ss.s_tw, ss.s_th, ss.s_trot = (
+                int(t["x"]), int(t["y"]), int(t["w"]), int(t["h"]), int(t["rot"]))
             st.rerun()
         else:
             st.toast("키프레임이 아직 없습니다.")
-    if b3.button("🗑 현재 프레임 키프레임 삭제", use_container_width=True):
+    if b2.button("🗑 현재 프레임 키프레임 삭제", use_container_width=True):
         delete_keyframe(box, ss.current_frame)
         st.toast(f"프레임 {ss.current_frame} 키프레임 삭제")
 
     if box["keyframes"]:
-        st.caption("저장된 키프레임: " + ", ".join(str(k["frame"]) for k in sorted(box["keyframes"], key=lambda x: x["frame"])))
+        st.caption("저장된 키프레임: " + ", ".join(
+            str(k["frame"]) for k in sorted(box["keyframes"], key=lambda x: x["frame"])))
     else:
         st.caption("아직 키프레임이 없습니다. 최소 2개를 만들면 보간이 시작됩니다.")
 
@@ -231,19 +305,24 @@ def keyframe_editor(box):
 def preview_and_export():
     ss = st.session_state
     size = (ss.canvas_w, ss.canvas_h)
-    st.subheader("👁 미리보기")
-    st.image(render_frame(ss.boxes, ss.current_frame, size, show_labels=True),
-             caption=f"프레임 {ss.current_frame} / {ss.total_frames - 1}")
+
+    st.subheader("👁 미리보기 (축소 렌더)")
+    scale = min(1.0, PREVIEW_MAX / max(size))
+    prev = render_frame(ss.boxes, ss.current_frame, size, scale=scale, show_labels=True)
+    st.image(prev, caption=f"프레임 {ss.current_frame} / {ss.total_frames - 1}  (×{scale:.2f})")
 
     st.divider()
     st.subheader("📤 내보내기")
+    interp = st.slider("보간 세밀도 (서브프레임 배수) — 클수록 부드러움", 1, 8, 1,
+                       help="키프레임 사이를 이 배수만큼 더 잘게 쪼개 선형보간합니다. 재생 속도는 동일.")
     if st.button("🎞 GIF 생성", use_container_width=True):
         if not ss.boxes or all(len(b["keyframes"]) == 0 for b in ss.boxes):
             st.warning("키프레임이 있는 상자가 필요합니다.")
         else:
             with st.spinner("렌더링 중..."):
-                gif_bytes = export_gif(ss.boxes, ss.total_frames, size, ss.fps)
-            st.image(gif_bytes, caption="결과 애니메이션")
+                gif_bytes = export_gif_cached(
+                    _signature(ss.boxes), ss.total_frames, ss.canvas_w, ss.canvas_h, ss.fps, interp)
+            st.image(gif_bytes, caption="결과 애니메이션 (원본 크기)")
             st.download_button("⬇️ GIF 다운로드", gif_bytes, file_name="animation.gif",
                                mime="image/gif", use_container_width=True)
 
