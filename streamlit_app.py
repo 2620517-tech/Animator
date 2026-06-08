@@ -240,15 +240,24 @@ def box_settings(box):
 
     with st.expander("✏️ 스케치 (선택 — 나중에 AI 입력으로 사용)"):
         if HAS_CANVAS:
+            # update_streamlit=False: 그리는 동안 새로고침 없이 부드럽게.
+            # 저장 버튼을 누른 rerun 시점에 현재 그림을 캡처한다.
             res = st_canvas(fill_color="rgba(0,0,0,0)", stroke_width=3, stroke_color="#000000",
                             background_color="#FFFFFF", height=200, width=200,
-                            drawing_mode="freedraw", update_streamlit=True,
+                            drawing_mode="freedraw", update_streamlit=False,
                             key=f"canvas_{box['id']}")
-            if res is not None and res.image_data is not None:
-                im = Image.fromarray(res.image_data.astype("uint8"), "RGBA")
-                buf = io.BytesIO()
-                im.save(buf, format="PNG")
-                box["sketch_png"] = buf.getvalue()
+            st.caption("그린 뒤 아래 버튼을 눌러 저장하세요.")
+            if st.button("💾 스케치 저장", key=f"savesketch_{box['id']}", use_container_width=True):
+                if res is not None and res.image_data is not None:
+                    im = Image.fromarray(res.image_data.astype("uint8"), "RGBA")
+                    buf = io.BytesIO()
+                    im.save(buf, format="PNG")
+                    box["sketch_png"] = buf.getvalue()
+                    st.toast("스케치 저장됨")
+                else:
+                    st.toast("그림이 비어 있습니다.")
+            if box.get("sketch_png"):
+                st.image(box["sketch_png"], width=120, caption="저장된 스케치")
         else:
             st.info("스케치 캔버스를 쓰려면 `pip install streamlit-drawable-canvas` 후 다시 실행하세요.")
 
