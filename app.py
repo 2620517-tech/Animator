@@ -240,7 +240,7 @@ def box_settings(box):
         if HAS_CANVAS:
             res = st_canvas(fill_color="rgba(0,0,0,0)", stroke_width=3, stroke_color="#000000",
                             background_color="#FFFFFF", height=200, width=200,
-                            drawing_mode="freedraw", update_streamlit=False,
+                            drawing_mode="freedraw", update_streamlit=True,
                             key=f"canvas_{box['id']}")
             if res is not None and res.image_data is not None:
                 im = Image.fromarray(res.image_data.astype("uint8"), "RGBA")
@@ -258,6 +258,16 @@ def keyframe_editor(box):
     # 현재 프레임(스크럽)은 form 밖 — 옮기면 미리보기가 따라옴
     ss.current_frame = st.slider("현재 프레임", 0, max(0, ss.total_frames - 1),
                                  min(ss.current_frame, ss.total_frames - 1))
+
+    # 프레임/상자가 바뀌면 그 시점의 보간값을 슬라이더에 자동 로드
+    # (똑같은 값으로 두 키프레임을 저장해 "움직이지 않는" 실수를 방지)
+    nav = (box["id"], ss.current_frame)
+    if ss.get("_nav") != nav:
+        t = transform_at(box, ss.current_frame)
+        if t:
+            ss.s_tx, ss.s_ty, ss.s_tw, ss.s_th, ss.s_trot = (
+                int(t["x"]), int(t["y"]), int(t["w"]), int(t["h"]), int(t["rot"]))
+        ss._nav = nav
 
     # 슬라이더 값이 캔버스 범위를 벗어나면 클램프(캔버스 크기 변경 대비)
     ss.s_tx = _clamp(int(ss.s_tx), 0, ss.canvas_w)
