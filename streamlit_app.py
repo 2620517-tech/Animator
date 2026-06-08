@@ -63,6 +63,8 @@ def add_box():
         "sketch_png": None,
         "ai_image": None,
         "keyframes": [],
+        # 상자별 편집기 작업값(키프레임이 없을 때 슬라이더 복원용)
+        "work": {"x": 256, "y": 256, "w": 120, "h": 120, "rot": 0},
     })
     ss.selected_box_id = bid
 
@@ -259,11 +261,11 @@ def keyframe_editor(box):
     ss.current_frame = st.slider("현재 프레임", 0, max(0, ss.total_frames - 1),
                                  min(ss.current_frame, ss.total_frames - 1))
 
-    # 프레임/상자가 바뀌면 그 시점의 보간값을 슬라이더에 자동 로드
-    # (똑같은 값으로 두 키프레임을 저장해 "움직이지 않는" 실수를 방지)
+    # 프레임/상자가 바뀌면 슬라이더를 그 상자의 값으로 자동 로드.
+    # 키프레임이 있으면 보간값을, 없으면 그 상자가 기억한 작업값(work)을 복원.
     nav = (box["id"], ss.current_frame)
     if ss.get("_nav") != nav:
-        t = transform_at(box, ss.current_frame)
+        t = transform_at(box, ss.current_frame) or box.get("work")
         if t:
             ss.s_tx, ss.s_ty, ss.s_tw, ss.s_th, ss.s_trot = (
                 int(t["x"]), int(t["y"]), int(t["w"]), int(t["h"]), int(t["rot"]))
@@ -285,6 +287,9 @@ def keyframe_editor(box):
         c2.slider("높이", 1, ss.canvas_h, key="s_th")
         st.slider("회전(방향, °)", -180, 180, key="s_trot")
         saved = st.form_submit_button("💾 현재 프레임에 키프레임 저장", use_container_width=True)
+
+    # 현재 슬라이더 값을 이 상자의 작업값으로 기억(상자 전환 시 복원에 사용)
+    box["work"] = {"x": ss.s_tx, "y": ss.s_ty, "w": ss.s_tw, "h": ss.s_th, "rot": ss.s_trot}
 
     if saved:
         set_keyframe(box, ss.current_frame, {
